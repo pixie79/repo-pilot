@@ -31,14 +31,47 @@ pub struct DiscoveryStats {
 }
 
 /// Walk every configured root and return the repos found, sorted by path.
+///
+/// A root is a container of repos, not a repo, so a root that is *itself* a
+/// checkout is not reported: `~/Projects` was named as somewhere to look, and
+/// answering with `~/Projects` itself is never what was being asked.
 pub fn discover(cfg: &Config) -> Result<(Vec<Discovered>, DiscoveryStats)> {
+    walk(&cfg.root_paths(), cfg, RootItself::Skip)
+}
+
+/// Walk one directory and return the repos at or below it, sorted by path.
+///
+/// The fleet operations scope themselves to where you are standing rather than
+/// to the configured roots, so unlike [`discover`] this one reports the
+/// directory itself when it is a repo. Standing inside a checkout and being
+/// told there are no repos here would be a lie of the most literal kind.
+pub fn discover_under(root: &Path, cfg: &Config) -> Result<(Vec<Discovered>, DiscoveryStats)> {
+    walk(
+        std::slice::from_ref(&root.to_path_buf()),
+        cfg,
+        RootItself::Report,
+    )
+}
+
+/// Whether a root that is itself a repo counts as one of the repos found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RootItself {
+    Report,
+    Skip,
+}
+
+fn walk(
+    roots: &[PathBuf],
+    cfg: &Config,
+    root_itself: RootItself,
+) -> Result<(Vec<Discovered>, DiscoveryStats)> {
     let excludes = build_excludes(&cfg.exclude)?;
     let prune: HashSet<String> = cfg.prune_names().into_iter().collect();
     let mut stats = DiscoveryStats::default();
     let mut found = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
-    for root in cfg.root_paths() {
+    for root in roots {
         if !root.is_dir() {
             tracing::warn!(root = %root.display(), "scan root does not exist");
             continue;
@@ -49,6 +82,7 @@ pub fn discover(cfg: &Config) -> Result<(Vec<Discovered>, DiscoveryStats)> {
             cfg,
             &excludes,
             &prune,
+            root_itself,
             &mut found,
             &mut seen,
             &mut stats,
@@ -60,11 +94,13 @@ pub fn discover(cfg: &Config) -> Result<(Vec<Discovered>, DiscoveryStats)> {
     Ok((found, stats))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_root(
     root: &Path,
     cfg: &Config,
     excludes: &Option<GlobSet>,
     prune: &HashSet<String>,
+    root_itself: RootItself,
     found: &mut Vec<Discovered>,
     seen: &mut HashSet<PathBuf>,
     stats: &mut DiscoveryStats,
@@ -142,7 +178,8 @@ fn walk_root(
             // Canonicalize so a symlinked path and its target can't both land
             // in the list.
             let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-            if seen.insert(canonical) && dir != root {
+            let report = dir != root || root_itself == RootItself::Report;
+            if seen.insert(canonical) && report {
                 let (group, name) = split_slug(root, &dir);
                 found.push(Discovered {
                     root: dir.clone(),
@@ -181,7 +218,15 @@ fn split_slug(root: &Path, repo: &Path) -> (String, String) {
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
     match parts.len() {
-        0 => (String::new(), root.display().to_string()),
+        // The root is the repo. Its name is the directory's, not the whole
+        // path: a row reading `/Users/me/GIT/thing` where every other row
+        // reads `thing` is noise.
+        0 => (
+            String::new(),
+            root.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.display().to_string()),
+        ),
         1 => (String::new(), parts[0].clone()),
         _ => (parts[0].clone(), parts[1..].join("/")),
     }

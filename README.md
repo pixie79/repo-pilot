@@ -1,23 +1,23 @@
-# drydock
+# repo-pilot
 
 ```
-     _                _            _
-  __| |_ __ _   _  __| | ___   ___| | __
- / _` | '__| | | |/ _` |/ _ \ / __| |/ /
-| (_| | |  | |_| | (_| | (_) | (__|   <
- \__,_|_|   \__, |\__,_|\___/ \___|_|\_\
-            |___/   what's still in for work.
+┬─┐┌─┐┌─┐┌─┐ ┌─┐┬┬  ┌─┐┌┬┐
+├┬┘├┤ ├─┘│ │─├─┘││  │ │ │
+┴└─└─┘┴  └─┘ ┴  ┴┴─┘└─┘ ┴   what's still in for work.
 ```
 
 **What's uncommitted, unpushed, and unreleased across every repo you own.**
 
-A drydock is where vessels sit while work is done on them, before they go back
-out. If you keep dozens or hundreds of checkouts on disk and lose track of which
+If you keep dozens or hundreds of checkouts on disk and lose track of which
 ones still have work sitting in them, this tells you, in one screen, live.
 
 Written in Rust. Works on macOS and Linux.
 
-![drydock](screenshot.png)
+A fork of [drydock](https://github.com/yetidevworks/drydock) by Andy Miller
+(MIT), which provides the dashboard, the discovery walk and the git probing.
+See [Licence](#licence).
+
+![repo-pilot](screenshot.png)
 
 Colour carries the state, so the rows worth acting on stand out without reading
 a word: yellow for uncommitted changes, cyan for commits you haven't pushed,
@@ -52,23 +52,17 @@ dimmed out of the way.
 
 ## Install
 
-**Homebrew**
+repo-pilot is not on crates.io or in a Homebrew tap. Install it from source:
 
 ```sh
-brew install yetidevworks/drydock/drydock
+cargo install --git https://github.com/pixie79/repo-pilot repo-pilot
 ```
 
-**Cargo**
+Or from a checkout:
 
 ```sh
-cargo install drydock
-```
-
-**From source**
-
-```sh
-git clone https://github.com/yetidevworks/drydock
-cd drydock
+git clone https://github.com/pixie79/repo-pilot
+cd repo-pilot
 make install          # into ~/.local/bin
 ```
 
@@ -77,7 +71,7 @@ make install          # into ~/.local/bin
 Run it with no arguments for the live dashboard:
 
 ```sh
-drydock
+repo-pilot
 ```
 
 It scans the directories in your config (`~/Projects` by default), *not* the
@@ -121,20 +115,20 @@ everything.
 ### Commands
 
 ```sh
-drydock list --dirty --since 1d              # a table, then exit
-drydock list --unpushed --group acme --json  # machine-readable
-drydock list --cached                        # last known state, no probing (~5ms)
-drydock list --behind --fetch                # check every remote, then show what's behind
-drydock list --behind --fetch -g acme        # ...just that group's remotes
-drydock releasable --min-commits 3           # what's worth a release pass
-drydock status .                             # everything about one repo
-drydock scan                                 # refresh the cache
-drydock scan --fetch                         # ...checking the remotes as it goes
-drydock groups                               # per-group tallies
-drydock config init                          # write a config file
+repo-pilot list --dirty --since 1d              # a table, then exit
+repo-pilot list --unpushed --group acme --json  # machine-readable
+repo-pilot list --cached                        # last known state, no probing (~5ms)
+repo-pilot list --behind --fetch                # check every remote, then show what's behind
+repo-pilot list --behind --fetch -g acme        # ...just that group's remotes
+repo-pilot releasable --min-commits 3           # what's worth a release pass
+repo-pilot status .                             # everything about one repo
+repo-pilot scan                                 # refresh the cache
+repo-pilot scan --fetch                         # ...checking the remotes as it goes
+repo-pilot groups                               # per-group tallies
+repo-pilot config init                          # write a config file
 ```
 
-Every command takes `--json`, so `drydock list --cached --json` is cheap enough
+Every command takes `--json`, so `repo-pilot list --cached --json` is cheap enough
 to drive a status line.
 
 ### Filters
@@ -227,7 +221,7 @@ own and a remote that wants credentials can hang. To do it:
 | | |
 |---|---|
 | `f` `F` `ctrl-f` | in the dashboard: the selected repo, everything on screen, the whole fleet |
-| `--fetch` | on `drydock list` and `drydock scan`, before anything is probed |
+| `--fetch` | on `repo-pilot list` and `repo-pilot scan`, before anything is probed |
 | `remote.fetch = true` | on a timer, every `remote.interval` |
 
 Every one of those is bounded by `remote.concurrency` (4 by default — raise it
@@ -236,7 +230,7 @@ if you're fetching hundreds and can wait less), capped per repo by
 A remote that can't be reached leaves that repo's counts exactly as stale as
 they were, and says so rather than passing them off as checked.
 
-`drydock list --fetch` narrows to `--group` when you pass one, so
+`repo-pilot list --fetch` narrows to `--group` when you pass one, so
 `--group acme --behind --fetch` is thirty fetches rather than five hundred.
 
 Tags come along with a fetch, by git's ordinary auto-follow. They have to: the
@@ -306,7 +300,7 @@ and grey is kept for the cells that hold no answer at all.
 
 If you know the markers the words are redundant, so there's a **`VIS`**
 column that's just the marker. It's four characters instead of fifteen, which
-at 120 columns is the difference between `drydock` and `dryd…` in the repo
+at 120 columns is the difference between `repo-pilot` and `dryd…` in the repo
 name. Pick it in the `C` picker, or use `"visibility_short"` in `[ui]
 columns`. The two forms are the same value, so asking for both gives you
 whichever you listed first.
@@ -326,7 +320,7 @@ you can see what each change costs before committing to it. Only REPO can't be
 turned off.
 
 Closing the panel writes the list to `[ui] columns` in your config, which the
-plain `drydock list` table reads too:
+plain `repo-pilot list` table reads too:
 
 ```toml
 [ui]
@@ -352,15 +346,15 @@ API traffic.
 
 ## Configuration
 
-`drydock config init` writes the defaults to
-`~/Library/Application Support/drydock/config.toml` on macOS, or
-`~/.config/drydock/config.toml` on Linux. The cache lives under
-`~/Library/Caches/drydock` or `~/.cache/drydock`. `drydock config path`
+`repo-pilot config init` writes the defaults to
+`~/Library/Application Support/repo-pilot/config.toml` on macOS, or
+`~/.config/repo-pilot/config.toml` on Linux. The cache lives under
+`~/Library/Caches/repo-pilot` or `~/.cache/repo-pilot`. `repo-pilot config path`
 prints both, whatever they resolved to.
 
 If you keep every tool's config in `~/.config` and sync it between machines,
 you can have that on macOS too. Either set `XDG_CONFIG_HOME` (and
-`XDG_CACHE_HOME`) explicitly, or just create `~/.config/drydock` — drydock
+`XDG_CACHE_HOME`) explicitly, or just create `~/.config/repo-pilot` — repo-pilot
 uses it if it's already there. Neither moves an existing config, so doing
 nothing keeps the platform default.
 
@@ -413,13 +407,13 @@ Every one of those is a command template with `{path}` replaced by the repo
 root, so point them at whatever you actually use — `["open", "-a", "iTerm",
 "{path}"]` for iTerm2, `["open", "-a", "Ghostty", "{path}"]` for Ghostty.
 
-`drydock config show` prints the effective config; `drydock config path` says
+`repo-pilot config show` prints the effective config; `repo-pilot config path` says
 where things live.
 
 ### Tags, and a note on git-flow
 
 With git-flow, tags land on `master` while work carries on on `develop`, so the
-newest tag by date often isn't an ancestor of `HEAD`. drydock reports the nearest
+newest tag by date often isn't an ancestor of `HEAD`. repo-pilot reports the nearest
 **reachable** tag as the primary number and flags the discrepancy rather than
 quietly picking one.
 
@@ -435,10 +429,15 @@ cargo test
 cargo test -- --ignored    # plus the slow watcher-startup regression test
 ```
 
-`drydock tui-snapshot --width 150 --height 40 --view help` renders one dashboard
+`repo-pilot tui-snapshot --width 150 --height 40 --view help` renders one dashboard
 frame to plain text, which is how the layout gets reviewed without a terminal.
 Views: `none`, `filtered`, `detail`, `help`, `search`, `scanning`.
 
 ## Licence
 
-MIT
+MIT.
+
+repo-pilot is a fork of [drydock](https://github.com/yetidevworks/drydock),
+Copyright (c) 2026 Andy Miller, used under the MIT licence. The upstream
+licence is preserved verbatim in `LICENSE` and `crates/repo-pilot/LICENSE`,
+and `CHANGELOG.md` is drydock's history up to the point of the fork.

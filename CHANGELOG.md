@@ -1,3 +1,22 @@
+# Unreleased (repo-pilot)
+
+repo-pilot forked from drydock 1.1.2. Everything below this line is drydock's
+history, kept because the code it describes is the code running here. The fork
+carries its own version (`0.1.0`) and does not continue drydock's numbering.
+
+1. [](#new)
+    * `repo-pilot export` — the discovered fleet as a JSON array of
+      `{gitUrl, path}`, for feeding into other tools.
+    * `repo-pilot update` — refresh each repo's default branch to latest and
+      put you back on the branch you were on, stashing and restoring
+      uncommitted work around the round trip.
+    * `repo-pilot roteiro` — run `roteiro init` or `roteiro sync` per repo,
+      whichever the repo needs.
+    * Those three scan below the current directory by default, rather than the
+      configured `roots`. `--root` overrides.
+
+---
+
 # 1.1.2
 
 ## 09/03/2026
