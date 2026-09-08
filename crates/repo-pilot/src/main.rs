@@ -69,8 +69,9 @@ async fn main() -> Result<()> {
             width,
             height,
             view,
+            html,
         }) => {
-            print!("{}", tui::snapshot(width, height, &view).await?);
+            print!("{}", tui::snapshot(width, height, &view, html).await?);
             Ok(())
         }
     }

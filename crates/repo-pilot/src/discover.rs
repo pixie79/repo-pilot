@@ -372,11 +372,9 @@ mod tests {
 
     #[test]
     fn excludes_match_relative_paths() {
-        let set = build_excludes(&["riffle-testbed/**".into()])
-            .unwrap()
-            .unwrap();
-        assert!(set.is_match(Path::new("riffle-testbed/work")));
-        assert!(set.is_match(Path::new("riffle-testbed")));
+        let set = build_excludes(&["fixtures/**".into()]).unwrap().unwrap();
+        assert!(set.is_match(Path::new("fixtures/work")));
+        assert!(set.is_match(Path::new("fixtures")));
         assert!(!set.is_match(Path::new("grav/grav")));
     }
 }

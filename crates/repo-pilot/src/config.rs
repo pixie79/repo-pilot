@@ -66,13 +66,12 @@ impl Default for Config {
             max_depth: 4,
             follow_nested_repos: false,
             follow_symlinks: false,
-            exclude: vec![
-                // Throwaway fixture repos: dozens of tiny checkouts that would
-                // otherwise swamp the list.
-                "riffle-testbed/**".into(),
-                "riffle-pr-testbed/**".into(),
-                "riffle-merge-test/**".into(),
-            ],
+            // Empty, because an exclude list is inherently personal: it names
+            // directories that exist on one person's disk. Upstream shipped
+            // its author's own fixture repos here, which excluded nothing for
+            // anybody else and quietly suggested that guessing was the plan.
+            // `config init` writes this out for you to fill in.
+            exclude: Vec::new(),
             prune: Vec::new(),
             refresh: RefreshConfig::default(),
             status: StatusConfig::default(),

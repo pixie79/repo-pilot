@@ -532,6 +532,13 @@ cargo test -- --ignored    # plus the slow watcher-startup regression test
 frame to plain text, which is how the layout gets reviewed without a terminal.
 Views: `none`, `filtered`, `detail`, `help`, `search`, `scanning`.
 
+Add `--html` and the same frame comes out as a standalone page with every
+cell's colour intact. That is what `scripts/screenshot.sh` feeds to a headless
+browser to regenerate `screenshot.png`, so the image in this README is drawn by
+the real UI code rather than scraped from someone's terminal, and cannot drift
+from what the dashboard actually renders. It shows whatever your configured
+`roots` hold, so run it somewhere with a fleet worth showing.
+
 ## Licence
 
 MIT.

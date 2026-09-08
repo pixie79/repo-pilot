@@ -106,9 +106,14 @@ that reports is untouched. `--root PATH` overrides.
 - **Cross-vendor review still required:** this branch was implemented by
   Claude, so the review must not be.
 
-## Still open
-- `scan.roots` defaults to `~/Projects`, which does not exist on this machine —
-  the reporting commands find nothing until `repo-pilot config init` is run and
-  the roots are pointed at `~/GIT`. Not a code change; worth doing once.
-- `screenshot.png` is still drydock's dashboard. The UI is unchanged, so it is
-  accurate, but it shows the old name in the header.
+## Follow-ups, now done
+- `scan.roots` pointed at `~/Projects`, which does not exist on this machine.
+  Config written with `roots = ["~/GIT"]`; the reporting commands now see 33
+  repos across 6 groups. The shipped default `exclude` list was upstream's
+  author's own fixture repos, which excluded nothing for anyone else — now
+  empty.
+- `screenshot.png` regenerated from the real dashboard against `~/GIT`, via a
+  new `tui-snapshot --html` and `scripts/screenshot.sh`.
+- Fixed while regenerating it: left-aligned table cells had no gutter, so a
+  value that exactly filled its column ran into the next one
+  (`Flutter-Globalebt/ebt-architecture`). Only GROUP ever showed it.

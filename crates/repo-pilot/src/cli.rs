@@ -123,6 +123,10 @@ pub enum Commands {
         /// Which overlay to render: none, help, detail, or columns.
         #[arg(long, default_value = "none")]
         view: String,
+        /// Emit a standalone HTML page with the colours intact, rather than
+        /// plain text. This is how `screenshot.png` is regenerated.
+        #[arg(long)]
+        html: bool,
     },
 }
 
