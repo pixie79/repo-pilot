@@ -1,6 +1,11 @@
-# 0.2.0
+# 0.2.1
 
 ## 08/09/2026
+
+The first published release. 0.2.0 was tagged but never reached crates.io:
+the tag predated the release workflow, and a tag-triggered workflow runs the
+file as it exists on the tagged commit, so it could never have fired. Rather
+than move a tag that was already pushed, the version moved on.
 
 repo-pilot forked from drydock 1.1.2. Everything below this line is drydock's
 history, kept because the code it describes is the code running here. The fork
