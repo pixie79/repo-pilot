@@ -99,7 +99,7 @@ fn init_tracing(dashboard: bool) {
 fn load_config() -> Arc<config::Config> {
     let (cfg, warning) = config::load_or_default();
     if let Some(warning) = warning {
-        eprintln!("drydock: using defaults, config could not be read: {warning}");
+        eprintln!("repo-pilot: using defaults, config could not be read: {warning}");
     }
     Arc::new(cfg)
 }
@@ -125,8 +125,8 @@ async fn gather(
 fn announce_fetch(fetch: &Fetch) {
     match fetch {
         Fetch::Skip => {}
-        Fetch::All => eprintln!("drydock: fetching every repo with a remote..."),
-        Fetch::Group(group) => eprintln!("drydock: fetching the {group} group..."),
+        Fetch::All => eprintln!("repo-pilot: fetching every repo with a remote..."),
+        Fetch::Group(group) => eprintln!("repo-pilot: fetching the {group} group..."),
     }
 }
 
@@ -147,7 +147,7 @@ fn print_fetch_note(timings: &probe::Timings) {
         String::new()
     };
     eprintln!(
-        "drydock: fetched {} repos in {}{failed}",
+        "repo-pilot: fetched {} repos in {}{failed}",
         timings.fetched,
         fmt::duration(timings.fetch)
     );
@@ -232,7 +232,7 @@ async fn cmd_list(args: ListArgs) -> Result<()> {
         let mut repos: Vec<RepoStatus> = cache::load().into_values().collect();
         repos.sort_by(|a, b| a.root.cmp(&b.root));
         if repos.is_empty() {
-            eprintln!("drydock: no cache yet, run `drydock scan` first");
+            eprintln!("repo-pilot: no cache yet, run `repo-pilot scan` first");
         }
         repos
     } else {
@@ -432,7 +432,7 @@ async fn cmd_scan(fast: bool, no_cache: bool, fetch: bool) -> Result<()> {
         if never > 0 {
             println!(
                 "{never} repos have never fetched, so their behind counts are unchecked. \
-                 Run `drydock scan --fetch` to check them."
+                 Run `repo-pilot scan --fetch` to check them."
             );
         }
     }
@@ -477,7 +477,7 @@ fn cmd_config(command: ConfigCommands) -> Result<()> {
         ConfigCommands::Show => {
             let (cfg, warning) = config::load_or_default();
             if let Some(warning) = warning {
-                eprintln!("drydock: showing defaults, config could not be read: {warning}");
+                eprintln!("repo-pilot: showing defaults, config could not be read: {warning}");
             }
             print!("{}", toml::to_string_pretty(&cfg)?);
             Ok(())

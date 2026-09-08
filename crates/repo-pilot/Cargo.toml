@@ -1,5 +1,5 @@
 [package]
-name = "drydock"
+name = "repo-pilot"
 version.workspace = true
 edition.workspace = true
 rust-version = "1.80"
@@ -8,12 +8,12 @@ authors.workspace = true
 repository.workspace = true
 homepage = "https://github.com/yetidevworks/drydock"
 readme = "README.md"
-description = "Live dashboard for a fleet of git repos: what's uncommitted, unpushed, and unreleased, at a glance."
-keywords = ["git", "tui", "dashboard", "monorepo", "release"]
+description = "A fleet dashboard for your git repos that can also update their default branch and keep Roteiro in sync. A fork of drydock."
+keywords = ["git", "tui", "dashboard", "monorepo", "roteiro"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "drydock"
+name = "repo-pilot"
 path = "src/main.rs"
 
 [dependencies]

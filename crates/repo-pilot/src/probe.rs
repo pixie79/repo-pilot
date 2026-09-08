@@ -418,7 +418,7 @@ pub async fn fetch_all(cfg: Arc<Config>, roots: Vec<PathBuf>) -> FetchReport {
     }
 }
 
-/// Probe one repo end to end. Used for `drydock status <path>` and by the
+/// Probe one repo end to end. Used for `repo-pilot status <path>` and by the
 /// watcher when a single repo changes; sweeps use the pipelined path below so
 /// tier 1 and tier 2 can run at different concurrencies.
 ///

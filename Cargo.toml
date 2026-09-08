@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/drydock"]
+members = ["crates/repo-pilot"]
 
 [workspace.package]
-version = "1.1.2"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["Andy Miller <andy@trilbymedia.com>"]
+authors = ["repo-pilot contributors"]
 repository = "https://github.com/yetidevworks/drydock"
 
 [profile.release]

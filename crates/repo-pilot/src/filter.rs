@@ -1,6 +1,6 @@
 //! Filtering, searching and sorting.
 //!
-//! The same [`Query`] drives both `drydock list` and the dashboard, so the two
+//! The same [`Query`] drives both `repo-pilot list` and the dashboard, so the two
 //! can never disagree about what "dirty in the last day" means.
 
 use serde::{Deserialize, Serialize};

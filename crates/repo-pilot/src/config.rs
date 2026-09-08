@@ -183,7 +183,7 @@ pub struct VisibilityConfig {
     /// Check each repo's public/private status via `gh repo view`. Off by
     /// default, for the same reason `remote.fetch` is: real network traffic
     /// against every remote you own, and it depends on `gh` being installed
-    /// and authenticated rather than anything `drydock` controls itself.
+    /// and authenticated rather than anything `repo-pilot` controls itself.
     pub enabled: bool,
     /// How long a checked visibility is trusted before it's worth asking
     /// again. Visibility changes rarely if ever, so this can be generous —

@@ -2,7 +2,7 @@ PREFIX ?= $(HOME)/.local
 
 .PHONY: install
 install:
-	cargo install --force --path crates/drydock --root $(PREFIX)
+	cargo install --force --path crates/repo-pilot --root $(PREFIX)
 
 .PHONY: check
 check:

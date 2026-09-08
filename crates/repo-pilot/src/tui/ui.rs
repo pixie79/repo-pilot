@@ -168,7 +168,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         .count();
     let mut spans = vec![
         Span::styled(
-            " drydock ",
+            " repo-pilot ",
             Style::default()
                 .fg(Color::Black)
                 .bg(ACCENT)

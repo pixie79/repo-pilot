@@ -211,7 +211,7 @@ mod tests {
     fn build_output_is_ignored() {
         let prune = prune_set();
         assert!(!is_interesting(
-            Path::new("/p/yetidevworks/drydock/target/debug/build.rs"),
+            Path::new("/p/yetidevworks/repo-pilot/target/debug/build.rs"),
             &prune
         ));
         assert!(!is_interesting(

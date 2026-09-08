@@ -619,7 +619,7 @@ fn scan_git_config(git_dir: &Path) -> GitConfigScan {
 ///
 /// Read off the filesystem rather than tracked by this tool, because the
 /// question is "when did anything last talk to the remote", not "when did
-/// drydock last talk to it". Git rewrites `FETCH_HEAD` on every fetch and
+/// repo-pilot last talk to it". Git rewrites `FETCH_HEAD` on every fetch and
 /// every pull, so a fetch you ran yourself in a terminal counts, which is the
 /// honest answer and the one that stops this from nagging about a repo you
 /// just pulled.

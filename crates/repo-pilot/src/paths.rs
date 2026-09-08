@@ -1,14 +1,14 @@
 //! Config and cache locations.
 //!
 //! Config goes in `dirs::config_dir()` (matching the sibling reeve and ytunnel
-//! tools): on macOS `~/Library/Application Support/drydock`, on Linux
-//! `~/.config/drydock`. The probe cache is disposable, so it goes in
+//! tools): on macOS `~/Library/Application Support/repo-pilot`, on Linux
+//! `~/.config/repo-pilot`. The probe cache is disposable, so it goes in
 //! `dirs::cache_dir()` instead.
 //!
 //! With one exception, and it only ever bites on macOS. Plenty of people keep
 //! every tool's config under `~/.config` and sync that one directory between
 //! machines, and macOS is the only platform where `dirs` ignores the XDG
-//! variables. So an explicit `$XDG_CONFIG_HOME`, or a `~/.config/drydock`
+//! variables. So an explicit `$XDG_CONFIG_HOME`, or a `~/.config/repo-pilot`
 //! that already exists, wins over the platform default. Neither costs anyone
 //! a migration: on Linux `dirs` already resolves to the same place, and on
 //! macOS a directory nobody created is never chosen.
@@ -16,15 +16,15 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-const APP: &str = "drydock";
+const APP: &str = "repo-pilot";
 
 /// Pick between an XDG-style location and the platform default.
 ///
 /// An absolute `$XDG_CONFIG_HOME` / `$XDG_CACHE_HOME` wins outright — that is
 /// someone stating where they want their files. A relative or empty one is
 /// ignored rather than resolved against the working directory, which is what
-/// the spec asks for. Failing that, an *existing* `~/.config/drydock` (or
-/// `~/.cache/drydock`) wins: creating that directory is the other way of
+/// the spec asks for. Failing that, an *existing* `~/.config/repo-pilot` (or
+/// `~/.cache/repo-pilot`) wins: creating that directory is the other way of
 /// saying the same thing, and only checking for it means this never moves
 /// anyone's files out from under them.
 fn resolve_dir(
@@ -76,7 +76,7 @@ pub fn cache_file() -> Result<PathBuf> {
 }
 
 pub fn log_file() -> Result<PathBuf> {
-    Ok(cache_dir()?.join("drydock.log"))
+    Ok(cache_dir()?.join("repo-pilot.log"))
 }
 
 /// Expand a leading `~` and make the path absolute.
@@ -115,7 +115,7 @@ mod tests {
                 ".config",
                 platform_default(),
             ),
-            Some(PathBuf::from("/somewhere/else/drydock"))
+            Some(PathBuf::from("/somewhere/else/repo-pilot"))
         );
     }
 
@@ -129,7 +129,7 @@ mod tests {
                     ".config",
                     platform_default()
                 ),
-                Some(PathBuf::from("/platform/default/drydock")),
+                Some(PathBuf::from("/platform/default/repo-pilot")),
                 "{var:?} should not have been honoured"
             );
         }
@@ -145,7 +145,7 @@ mod tests {
         );
     }
 
-    // The whole point of only ever *checking* for `~/.config/drydock`: someone
+    // The whole point of only ever *checking* for `~/.config/repo-pilot`: someone
     // who has never asked for this keeps the platform default, and nothing
     // they own moves.
     #[test]
@@ -153,11 +153,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         assert_eq!(
             resolve_dir(None, Some(home.path()), ".config", platform_default()),
-            Some(PathBuf::from("/platform/default/drydock"))
+            Some(PathBuf::from("/platform/default/repo-pilot"))
         );
     }
 
-    // A `~/.config/drydock` that is somehow a *file* is not a config
+    // A `~/.config/repo-pilot` that is somehow a *file* is not a config
     // directory, and picking it would fail later with a much worse message.
     #[test]
     fn a_file_where_the_dot_config_dir_would_be_is_not_mistaken_for_one() {
@@ -166,7 +166,7 @@ mod tests {
         std::fs::write(home.path().join(".config").join(APP), "not a directory").unwrap();
         assert_eq!(
             resolve_dir(None, Some(home.path()), ".config", platform_default()),
-            Some(PathBuf::from("/platform/default/drydock"))
+            Some(PathBuf::from("/platform/default/repo-pilot"))
         );
     }
 

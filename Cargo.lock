@@ -434,31 +434,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "drydock"
-version = "1.1.2"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "dirs",
- "globset",
- "notify",
- "notify-debouncer-full",
- "num_cpus",
- "ratatui",
- "serde",
- "serde_json",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "walkdir",
-]
-
-[[package]]
 name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1439,6 +1414,31 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "repo-pilot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "dirs",
+ "globset",
+ "notify",
+ "notify-debouncer-full",
+ "num_cpus",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
 
 [[package]]
 name = "rustc_version"

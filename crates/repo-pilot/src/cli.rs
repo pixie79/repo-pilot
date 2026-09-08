@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "drydock",
+    name = "repo-pilot",
     version,
     about = "What's uncommitted, unpushed, and unreleased across every repo you own.",
     long_about = None
