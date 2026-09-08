@@ -6,10 +6,13 @@
 ┴└─└─┘┴  └─┘ ┴  ┴┴─┘└─┘ ┴   what's still in for work.
 ```
 
-**What's uncommitted, unpushed, and unreleased across every repo you own.**
+**What's uncommitted, unpushed, and unreleased across every repo you own —
+and the fleet operations to do something about it.**
 
 If you keep dozens or hundreds of checkouts on disk and lose track of which
 ones still have work sitting in them, this tells you, in one screen, live.
+Then `update` brings every default branch to latest without touching your
+working branch, and `export` hands the whole fleet to whatever comes next.
 
 Written in Rust. Works on macOS and Linux.
 
@@ -128,6 +131,9 @@ repo-pilot groups                               # per-group tallies
 repo-pilot config init                          # write a config file
 ```
 
+Plus the three that act on the fleet rather than reporting on it — `export`,
+`update` and `roteiro`. They have their own section below.
+
 Every command takes `--json`, so `repo-pilot list --cached --json` is cheap enough
 to drive a status line.
 
@@ -143,6 +149,99 @@ Release state: `--unreleased` (never tagged), `--needs-release`, `--released`.
 
 Several filters **widen** the result by default: `--dirty --unpushed` means
 "either". Pass `--match all` (or press `&`) to require all of them instead.
+
+## Fleet operations
+
+Everything above *reports*. These three *act*, and they differ from the rest of
+the tool in two ways worth knowing before you run them.
+
+They work on the repos below **where you are standing**, not on the configured
+`roots`. Reporting should give the same answer wherever it is run from; acting
+on whatever happens to be under your current directory is the entire point of
+`cd`. Pass `--root PATH` to work somewhere else.
+
+And they run one repo at a time. The probe sweep is heavily concurrent because
+reads don't collide; these take index locks and move `HEAD` around, so they go
+in order and say what happened to each repo as they go. A sweep with any
+failure in it exits non-zero.
+
+```sh
+repo-pilot export                    # the fleet as JSON, for piping onwards
+repo-pilot update                    # refresh every default branch
+repo-pilot update --rebase never     # ...without being asked about rebasing
+repo-pilot roteiro                   # init or sync the Roteiro graph in each
+```
+
+### `export`
+
+Prints a JSON array of every repo below here — where it is, and where it came
+from:
+
+```json
+[
+  { "gitUrl": "git@github.com:acme/api.git", "path": "acme/api" },
+  { "gitUrl": null, "path": "scratch/notes" }
+]
+```
+
+`path` is relative to where the sweep started. `gitUrl` is `origin` when there
+is one, otherwise whatever remote is configured, and `null` for a repo that
+only ever existed on this disk — which is usually the row you were looking for.
+
+This is not a shape of `list --json`. That one is the dashboard's view of a
+*probed* fleet, thirty-odd fields deep, and it costs a full probe to produce.
+This is a manifest, and it costs one small config-file read per repo, so it
+stays quick across hundreds of them.
+
+### `update`
+
+Brings each repo's default branch up to date and puts you back where you were.
+Per repo, in order:
+
+1. Stash anything uncommitted, including untracked files.
+2. Work out the default branch — `origin/HEAD` if the clone set it, otherwise
+   the first of `main`, `master`, `develop`, `trunk` that exists on the remote.
+3. Check it out and fast-forward it.
+4. Check the original branch back out.
+5. Restore the stash.
+6. Offer to rebase the working branch onto the freshly-updated default.
+
+Uncommitted work surviving that sequence is the whole design problem, so
+nothing is ever discarded. A stash that will not pop is **left in the stash
+list** with the command to recover it printed, because a conflict you resolve
+by hand beats work that quietly went away.
+
+The pull is `--ff-only`. A default branch that has diverged from its remote has
+no safe automatic answer, and a merge commit invented by a sweep across two
+hundred repos is the least safe one available — so it is reported and skipped,
+with the branch and the stash still restored.
+
+Repos on a **detached HEAD** and repos with **no origin remote** are skipped
+with a reason rather than guessed at. A repo already on its default branch is
+pulled in place, with no checkout and no rebase offered.
+
+| | |
+|---|---|
+| `--rebase ask` | prompt per repo. The default. Means `never` when stdin is not a terminal, so a scripted run can't hang on a question |
+| `--rebase always` | rebase every working branch that has somewhere to go |
+| `--rebase never` | don't offer it |
+| `--timeout N` | seconds allowed per `git pull`, default 120 |
+
+The rebase is only offered when it could succeed: a tree still holding restored
+changes says so instead. A rebase that fails is aborted, never left half-done.
+
+### `roteiro`
+
+[Roteiro](https://github.com/OffeneDatenmodellierung/Roteiro) is a codebase
+knowledge-graph CLI. This runs `roteiro init` in repos that have never had it
+and `roteiro sync` in repos that have, deciding per repo from whether a store
+is already there.
+
+The decision leans towards `sync`, because `init` writes into a repo — hooks, a
+config file, an agent skill — and running it over a repo that already made
+those choices is the expensive mistake. `roteiro` missing from `PATH` fails
+once, up front, rather than once per repo. `--timeout` defaults to 600 seconds,
+since a first `init` on a large repo builds the whole graph.
 
 ## How it works, and why it's quick
 
