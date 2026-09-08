@@ -228,13 +228,7 @@ impl Column {
     /// because it colours and marks cells this can't.
     pub fn cell(&self, repo: &RepoStatus, now: i64, show_paths: bool) -> String {
         match self {
-            Column::Group => {
-                if repo.group.is_empty() {
-                    "·".into()
-                } else {
-                    repo.group.clone()
-                }
-            }
+            Column::Group => repo.group_label().to_string(),
             Column::Repo => {
                 if show_paths {
                     paths::contract(&repo.root)
@@ -450,6 +444,21 @@ mod tests {
         repo.refs.as_mut().unwrap().fetched_at = None;
         assert_eq!(Column::Behind.cell(&repo, 0, false), "·");
         assert_eq!(Column::Fetched.cell(&repo, 0, false), "·");
+    }
+
+    // A repo sitting directly in a scan root has no group. The table said `·`
+    // and the dashboard, which builds its own cells so it can colour them,
+    // left it blank — so the same repo read as "no group" in one view and
+    // "unknown" in the other. Both go through `group_label` now.
+    #[test]
+    fn a_repo_with_no_group_says_so_rather_than_leaving_a_blank() {
+        let loose = RepoStatus::new("/tmp/x".into(), String::new(), "sandbox".into());
+        assert_eq!(loose.group_label(), "·");
+        assert_eq!(Column::Group.cell(&loose, 0, false), "·");
+
+        let grouped = RepoStatus::new("/tmp/x".into(), "acme".into(), "api".into());
+        assert_eq!(grouped.group_label(), "acme");
+        assert_eq!(Column::Group.cell(&grouped, 0, false), "acme");
     }
 
     // The bug this pair of columns used to have: BRANCH named the checked-out

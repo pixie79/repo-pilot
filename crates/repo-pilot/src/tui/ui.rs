@@ -416,7 +416,7 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
         .map(|(col, w)| {
             let w = *w;
             match col {
-                Column::Group => Span::styled(pad(&repo.group, w), base.fg(DIM)),
+                Column::Group => Span::styled(pad(repo.group_label(), w), base.fg(DIM)),
                 Column::Repo => Span::styled(
                     pad(&fmt::truncate(&repo.name, w.saturating_sub(1)), w),
                     if flags.clean() {

@@ -655,6 +655,22 @@ impl RepoStatus {
             .unwrap_or(0)
     }
 
+    /// The group cell. A repo sitting directly in a scan root has no group, and
+    /// an empty cell reads as missing data rather than as "there isn't one" —
+    /// so it gets the same `·` every other column uses for a real nothing.
+    ///
+    /// Here rather than in either renderer because there are two of them: the
+    /// plain-text table and the dashboard, which draws its own cells so it can
+    /// colour them. They had drifted, and the dashboard was the one showing a
+    /// blank.
+    pub fn group_label(&self) -> &str {
+        if self.group.is_empty() {
+            "·"
+        } else {
+            &self.group
+        }
+    }
+
     pub fn branch_label(&self) -> String {
         self.refs
             .as_ref()
