@@ -1,0 +1,75 @@
+name: Release
+
+# Publishing is permanent: `cargo yank` stops new dependents resolving to a
+# version but never removes it, and a version number can never be reused. So
+# this runs only on a deliberate `v*` tag, and gates the upload behind the same
+# checks CI runs plus two of its own.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package and verify, but don't upload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # A tag that disagrees with Cargo.toml publishes the wrong thing under
+      # the right name, and there is no taking it back. Cheapest possible check.
+      - name: Tag must match the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "repo-pilot") | .version')
+          if [[ "$tag" != "$crate" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME says $tag, Cargo.toml says $crate"
+            exit 1
+          fi
+          echo "Publishing repo-pilot $crate"
+
+      # Never publish something that doesn't pass its own gates. CI covers
+      # pull requests; a tag can be pushed without ever opening one.
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+      # Catches the packaging-only failures a normal build cannot: a file left
+      # out of the tarball, or a path that only resolves in a git checkout.
+      - name: Verify the package builds from its tarball
+        run: cargo publish -p repo-pilot --dry-run
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p repo-pilot
