@@ -112,8 +112,11 @@ that reports is untouched. `--root PATH` overrides.
   repos across 6 groups. The shipped default `exclude` list was upstream's
   author's own fixture repos, which excluded nothing for anyone else — now
   empty.
-- `screenshot.png` regenerated from the real dashboard against `~/GIT`, via a
-  new `tui-snapshot --html` and `scripts/screenshot.sh`.
+- `screenshot.png` regenerated from the real dashboard, via a new
+  `tui-snapshot --html` and `scripts/screenshot.sh`. It renders against a
+  synthetic 19-repo fleet built by `scripts/demo-fleet.sh`, not against `~/GIT`:
+  a screenshot of real checkouts publishes real branch names and cannot be
+  reproduced by anyone else.
 - Fixed while regenerating it: left-aligned table cells had no gutter, so a
   value that exactly filled its column ran into the next one
   (`Flutter-Globalebt/ebt-architecture`). Only GROUP ever showed it.

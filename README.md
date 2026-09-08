@@ -534,10 +534,18 @@ Views: `none`, `filtered`, `detail`, `help`, `search`, `scanning`.
 
 Add `--html` and the same frame comes out as a standalone page with every
 cell's colour intact. That is what `scripts/screenshot.sh` feeds to a headless
-browser to regenerate `screenshot.png`, so the image in this README is drawn by
-the real UI code rather than scraped from someone's terminal, and cannot drift
-from what the dashboard actually renders. It shows whatever your configured
-`roots` hold, so run it somewhere with a fleet worth showing.
+browser to regenerate `screenshot.png`, so the image at the top of this README
+is drawn by the real UI code rather than scraped from someone's terminal, and
+cannot drift from what the dashboard actually renders.
+
+It renders against a throwaway fleet built by `scripts/demo-fleet.sh` rather
+than against whatever you happen to have checked out — a screenshot of real
+work publishes real branch names, and makes the image unreproducible by anyone
+else. The synthetic part is the fleet, not the rendering: those are real git
+repos with real commits, tags and remote-tracking refs, covering dirty, ahead,
+behind, released, needs-release, never-released, detached and no-remote, so the
+dashboard is doing exactly what it does against yours. `KEEP=1
+scripts/demo-fleet.sh /tmp/fleet` leaves one on disk to poke at.
 
 ## Licence
 
