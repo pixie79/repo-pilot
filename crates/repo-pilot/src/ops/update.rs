@@ -642,6 +642,19 @@ mod tests {
 
         git(base, &["clone", "-q", "upstream.git", "work"]);
         let work = base.join("work");
+
+        // A repo-local identity, because the code under test writes commits of
+        // its own: `git rebase` replays them, and git refuses to commit without
+        // knowing who is committing. The `git()` helper's GIT_AUTHOR_* env vars
+        // don't cover it — that helper is how the *fixture* is built, while the
+        // rebase is run by `run_write`, which deliberately does not sanitise
+        // the environment because production code has no business doing so.
+        // Without this the test leans on whatever identity the machine happens
+        // to provide, which is why it passed on a laptop and failed on a CI
+        // runner that has none.
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["config", "user.email", "t@e"]);
+
         git(&work, &["reset", "-q", "--hard", "HEAD~1"]);
         (dir, work)
     }
@@ -747,6 +760,15 @@ mod tests {
 
         let outcome = update_one(&repo, Rebase::Always, LOCAL).await.unwrap();
         assert!(matches!(outcome.kind, Kind::Done), "{}", outcome.note);
+        // A rebase that failed and was cleanly aborted is still a `Done`
+        // outcome — the sweep carried on, which is the point. So the kind alone
+        // does not say the rebase happened, and asserting only on it let a
+        // silently-aborted rebase through as a pass.
+        assert!(
+            outcome.note.contains("rebased onto main"),
+            "expected a rebase, got {:?}",
+            outcome.note
+        );
         assert_eq!(
             out(&repo, &["symbolic-ref", "--short", "HEAD"]),
             "feature/y"
