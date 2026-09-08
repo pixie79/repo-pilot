@@ -20,7 +20,7 @@ A fork of [drydock](https://github.com/yetidevworks/drydock) by Andy Miller
 (MIT), which provides the dashboard, the discovery walk and the git probing.
 See [Licence](#licence).
 
-![repo-pilot](screenshot.png)
+![repo-pilot](https://raw.githubusercontent.com/pixie79/repo-pilot/main/screenshot.png)
 
 Colour carries the state, so the rows worth acting on stand out without reading
 a word: yellow for uncommitted changes, cyan for commits you haven't pushed,

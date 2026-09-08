@@ -1,8 +1,10 @@
-# Unreleased (repo-pilot)
+# 0.2.0
+
+## 08/09/2026
 
 repo-pilot forked from drydock 1.1.2. Everything below this line is drydock's
 history, kept because the code it describes is the code running here. The fork
-carries its own version (`0.1.0`) and does not continue drydock's numbering.
+carries its own version and does not continue drydock’s numbering.
 
 1. [](#new)
     * `repo-pilot export` — the discovered fleet as a JSON array of
