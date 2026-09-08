@@ -55,18 +55,22 @@ dimmed out of the way.
 
 ## Install
 
-repo-pilot is not on crates.io or in a Homebrew tap. Install it from source:
-
 ```sh
-cargo install --git https://github.com/pixie79/repo-pilot repo-pilot
+cargo install repo-pilot
 ```
 
-Or from a checkout:
+There is no Homebrew tap. From a checkout instead:
 
 ```sh
 git clone https://github.com/pixie79/repo-pilot
 cd repo-pilot
 make install          # into ~/.local/bin
+```
+
+Or straight from git, to track `main` ahead of a release:
+
+```sh
+cargo install --git https://github.com/pixie79/repo-pilot repo-pilot
 ```
 
 ## Use
