@@ -81,6 +81,87 @@ async fn try_git(root: &Path, args: &[&str]) -> Option<String> {
     run_git(root, args).await.ok()
 }
 
+/// What a git command that was allowed to fail actually did.
+#[derive(Debug, Clone)]
+pub struct GitOutcome {
+    pub ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl GitOutcome {
+    /// The best one-line explanation of a failure: git's last line of stderr,
+    /// which is the actual complaint, rather than the first, which is usually
+    /// a hint about the complaint.
+    pub fn why(&self) -> String {
+        self.stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("no output")
+            .to_string()
+    }
+}
+
+/// One `git` invocation that is allowed to *change* the repository.
+///
+/// Deliberately not [`run_git`], for three reasons that all cut the same way.
+/// `run_git` passes `--no-optional-locks` and sets `GIT_OPTIONAL_LOCKS=0` so a
+/// sweep across a few hundred repos never fights any of them for the index
+/// lock — correct for reading, wrong for writing, where the lock is the thing
+/// keeping the write safe. Its thirty-second cap is generous for a local
+/// `rev-list` and far too tight for a `pull` over a slow link, so the timeout
+/// is the caller's to choose. And a non-zero exit here is ordinary — a stash
+/// that pops into a conflict, a pull that isn't a fast-forward — so it is
+/// reported rather than raised, leaving the caller to decide whether the sweep
+/// carries on.
+///
+/// `GIT_TERMINAL_PROMPT=0` and the empty askpass stay: a fleet operation that
+/// stops on repo 40 of 200 waiting for a password nobody is there to type is
+/// worse than one that reports 160 failures.
+pub async fn run_write(root: &Path, args: &[&str], timeout: Duration) -> Result<GitOutcome> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg("core.quotepath=false")
+        .arg("-c")
+        .arg("color.ui=false")
+        .arg("-c")
+        .arg("credential.interactive=false")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "git {} timed out after {}s",
+                args.join(" "),
+                timeout.as_secs()
+            )
+        })?
+        .with_context(|| format!("Running git {}", args.join(" ")))?;
+
+    Ok(GitOutcome {
+        ok: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
+/// A read-only query on the write path, for the state checks that decide what
+/// the write should be. Same isolation, same "failure is an answer" contract.
+pub async fn query(root: &Path, args: &[&str]) -> Result<GitOutcome> {
+    run_write(root, args, GIT_TIMEOUT).await
+}
+
 /// Resolve the real git directory for a checkout, following the `gitdir:`
 /// pointer that worktrees and submodules leave in a `.git` file.
 pub fn resolve_git_dir(root: &Path) -> Result<PathBuf> {
@@ -1027,56 +1108,45 @@ mod tests {
     fn git_flow_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com")
-                .output()
-                .expect("git should run");
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
 
-        git(&["init", "-q", "-b", "master"]);
+        git(path, &["init", "-q", "-b", "master"]);
         std::fs::write(path.join("a.txt"), "a").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "initial"]);
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-qm", "initial"]);
 
-        git(&["checkout", "-q", "-b", "develop"]);
+        git(path, &["checkout", "-q", "-b", "develop"]);
         std::fs::write(path.join("b.txt"), "b").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "the work being released"]);
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-qm", "the work being released"]);
 
         // Release: develop merges to master, tagged there.
-        git(&["checkout", "-q", "master"]);
-        git(&[
-            "merge",
-            "-q",
-            "--no-ff",
-            "develop",
-            "-m",
-            "Merge release/1.0.0",
-        ]);
-        git(&["tag", "1.0.0"]);
+        git(path, &["checkout", "-q", "master"]);
+        git(
+            path,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "develop",
+                "-m",
+                "Merge release/1.0.0",
+            ],
+        );
+        git(path, &["tag", "1.0.0"]);
 
         // And the tag merges back into develop, which is the whole problem.
-        git(&["checkout", "-q", "develop"]);
-        git(&[
-            "merge",
-            "-q",
-            "--no-ff",
-            "1.0.0",
-            "-m",
-            "Merge tag '1.0.0' into develop",
-        ]);
+        git(path, &["checkout", "-q", "develop"]);
+        git(
+            path,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "1.0.0",
+                "-m",
+                "Merge tag '1.0.0' into develop",
+            ],
+        );
         dir
     }
 
@@ -1087,33 +1157,21 @@ mod tests {
     async fn tags_left_over_from_a_previous_life_are_not_releases() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com")
-                .output()
-                .expect("git should run");
-            assert!(out.status.success(), "git {args:?} failed");
-        };
 
-        git(&["init", "-q", "-b", "main"]);
+        git(path, &["init", "-q", "-b", "main"]);
         std::fs::write(path.join("old.txt"), "old").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "the old theme"]);
-        git(&["tag", "1.1.0"]);
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-qm", "the old theme"]);
+        git(path, &["tag", "1.1.0"]);
 
         // Rewritten from scratch: a fresh root commit, and `main` moved onto it
         // so nothing references the tagged commit any more.
-        git(&["checkout", "-q", "--orphan", "rewrite"]);
-        git(&["rm", "-rqf", "."]);
+        git(path, &["checkout", "-q", "--orphan", "rewrite"]);
+        git(path, &["rm", "-rqf", "."]);
         std::fs::write(path.join("new.txt"), "new").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "rewritten from scratch"]);
-        git(&["branch", "-qM", "main"]);
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-qm", "rewritten from scratch"]);
+        git(path, &["branch", "-qM", "main"]);
 
         let refs = probe_refs(path, &Config::default()).await.unwrap();
         assert_eq!(
@@ -1136,16 +1194,8 @@ mod tests {
     async fn a_tag_on_a_sibling_branch_is_still_a_release() {
         let dir = git_flow_repo();
         let path = dir.path();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .output()
-                .expect("git should run");
-            assert!(out.status.success(), "git {args:?} failed");
-        };
         // A branch that forked before the release ever happened.
-        git(&["checkout", "-q", "-b", "side", "master~1"]);
+        git(path, &["checkout", "-q", "-b", "side", "master~1"]);
 
         let refs = probe_refs(path, &Config::default()).await.unwrap();
         assert!(refs.described_tag.is_none(), "the tag is unreachable");
@@ -1180,26 +1230,18 @@ mod tests {
     async fn a_merge_that_changes_the_tree_still_counts() {
         let dir = git_flow_repo();
         let path = dir.path();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(path)
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com")
-                .output()
-                .unwrap();
-        };
 
         // A branch off the tagged commit, merged into develop. The merge is the
         // only thing develop gains that isn't already reachable another way.
-        git(&["checkout", "-q", "-b", "hotfix", "1.0.0"]);
+        git(path, &["checkout", "-q", "-b", "hotfix", "1.0.0"]);
         std::fs::write(path.join("fix.txt"), "fix").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "the hotfix"]);
-        git(&["checkout", "-q", "develop"]);
-        git(&["merge", "-q", "--no-ff", "hotfix", "-m", "Merge hotfix"]);
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-qm", "the hotfix"]);
+        git(path, &["checkout", "-q", "develop"]);
+        git(
+            path,
+            &["merge", "-q", "--no-ff", "hotfix", "-m", "Merge hotfix"],
+        );
 
         let refs = probe_refs(path, &Config::default()).await.unwrap();
         assert_eq!(
@@ -1216,23 +1258,12 @@ mod tests {
     #[tokio::test]
     async fn commits_after_the_back_merge_still_count() {
         let dir = git_flow_repo();
-        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
-        for args in [
-            vec!["add", "-A"],
-            vec!["commit", "-qm", "a genuine fix after the release"],
-        ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(dir.path())
-                .env("GIT_AUTHOR_NAME", "t")
-                .env("GIT_AUTHOR_EMAIL", "t@example.com")
-                .env("GIT_COMMITTER_NAME", "t")
-                .env("GIT_COMMITTER_EMAIL", "t@example.com")
-                .output()
-                .unwrap();
-        }
+        let path = dir.path();
+        std::fs::write(path.join("c.txt"), "c").unwrap();
+        git(path, &["add", "-A"]);
+        git(path, &["commit", "-qm", "a genuine fix after the release"]);
 
-        let refs = probe_refs(dir.path(), &Config::default()).await.unwrap();
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
         assert_eq!(refs.commits_since_tag, Some(1));
         assert_eq!(
             refs.since_tag_subjects,

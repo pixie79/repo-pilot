@@ -62,6 +62,52 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Print every repo below here as JSON: its origin URL and its path.
+    ///
+    /// Unlike `list --json`, which is the dashboard's view of a probed fleet,
+    /// this is a manifest for feeding into something else. It reads no more
+    /// than each repo's git config, so it is quick even on a large tree.
+    Export {
+        /// Look below this directory instead of the current one.
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+    },
+
+    /// Bring each repo's default branch up to date, then put you back on the
+    /// branch you were on.
+    ///
+    /// Per repo: stash anything uncommitted, check out the default branch,
+    /// fast-forward it, check the original branch back out, restore the stash,
+    /// and offer to rebase. Repos on a detached HEAD, or with no origin
+    /// remote, are skipped rather than guessed at.
+    Update {
+        /// Look below this directory instead of the current one.
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+
+        /// Whether to rebase the working branch onto the updated default
+        /// branch. `ask` prompts per repo, and means `never` when stdin is
+        /// not a terminal.
+        #[arg(long, default_value = "ask", value_name = "ask|always|never")]
+        rebase: String,
+
+        /// Seconds to allow each `git pull` before giving up on that repo.
+        #[arg(long, default_value_t = 120, value_name = "SECONDS")]
+        timeout: u64,
+    },
+
+    /// Run `roteiro init` or `roteiro sync` in each repo, whichever it needs.
+    Roteiro {
+        /// Look below this directory instead of the current one.
+        #[arg(long, value_name = "PATH")]
+        root: Option<String>,
+
+        /// Seconds to allow roteiro per repo. A first `init` on a large repo
+        /// builds the whole graph, so this is generous by default.
+        #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+        timeout: u64,
+    },
+
     /// Show where config and cache live, or write a starter config.
     #[command(subcommand)]
     Config(ConfigCommands),
@@ -77,6 +123,10 @@ pub enum Commands {
         /// Which overlay to render: none, help, detail, or columns.
         #[arg(long, default_value = "none")]
         view: String,
+        /// Emit a standalone HTML page with the colours intact, rather than
+        /// plain text. This is how `screenshot.png` is regenerated.
+        #[arg(long)]
+        html: bool,
     },
 }
 

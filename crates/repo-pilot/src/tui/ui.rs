@@ -416,7 +416,7 @@ fn repo_line(repo: &RepoStatus, layout: &TableLayout, now: i64, selected: bool) 
         .map(|(col, w)| {
             let w = *w;
             match col {
-                Column::Group => Span::styled(pad(&repo.group, w), base.fg(DIM)),
+                Column::Group => Span::styled(pad(repo.group_label(), w), base.fg(DIM)),
                 Column::Repo => Span::styled(
                     pad(&fmt::truncate(&repo.name, w.saturating_sub(1)), w),
                     if flags.clean() {
@@ -1259,10 +1259,22 @@ fn render_detail(f: &mut Frame, app: &App, area: Rect) -> u16 {
 
 // ---------------------------------------------------------------------------
 
+/// Pad a left-aligned cell to `width`, always keeping one column of gutter.
+///
+/// Columns are laid out edge to edge, with each cell's own padding providing
+/// the gap. A value that exactly filled its cell therefore ran straight into
+/// the next column: `Flutter-Global` beside `ebt/ebt-architecture` read as one
+/// word, `Flutter-Globalebt/ebt-architecture`. Short data hides it, which is
+/// why only GROUP ever showed it — long group names are the one left-aligned
+/// value that routinely fills its cell.
 fn pad(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let usable = width - 1;
     let len = text.chars().count();
-    if len >= width {
-        fmt::truncate(text, width)
+    if len > usable {
+        format!("{} ", fmt::truncate(text, usable))
     } else {
         format!("{text}{}", " ".repeat(width - len))
     }

@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["repo-pilot contributors"]
-repository = "https://github.com/yetidevworks/drydock"
+repository = "https://github.com/pixie79/repo-pilot"
 
 [profile.release]
 lto = "thin"

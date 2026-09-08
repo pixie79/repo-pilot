@@ -8,6 +8,7 @@ mod fmt;
 mod gh;
 mod git;
 mod model;
+mod ops;
 mod paths;
 mod probe;
 mod provider;
@@ -46,13 +47,31 @@ async fn main() -> Result<()> {
             fetch,
         }) => cmd_scan(fast, no_cache, fetch).await,
         Some(Commands::Groups { json }) => cmd_groups(json).await,
+        Some(Commands::Export { root }) => {
+            ops::export::run(&ops::scope(root.as_deref())?, &load_config())
+        }
+        Some(Commands::Update {
+            root,
+            rebase,
+            timeout,
+        }) => cmd_update(root, &rebase, timeout).await,
+        Some(Commands::Roteiro { root, timeout }) => {
+            let ok = ops::roteiro::run(
+                &ops::scope(root.as_deref())?,
+                &load_config(),
+                std::time::Duration::from_secs(timeout),
+            )
+            .await?;
+            exit_on(ok)
+        }
         Some(Commands::Config(c)) => cmd_config(c),
         Some(Commands::TuiSnapshot {
             width,
             height,
             view,
+            html,
         }) => {
-            print!("{}", tui::snapshot(width, height, &view).await?);
+            print!("{}", tui::snapshot(width, height, &view, html).await?);
             Ok(())
         }
     }
@@ -102,6 +121,28 @@ fn load_config() -> Arc<config::Config> {
         eprintln!("repo-pilot: using defaults, config could not be read: {warning}");
     }
     Arc::new(cfg)
+}
+
+async fn cmd_update(root: Option<String>, rebase: &str, timeout: u64) -> Result<()> {
+    let rebase = ops::update::Rebase::from_str(rebase).map_err(|why| anyhow!("--rebase: {why}"))?;
+    let ok = ops::update::run(
+        &ops::scope(root.as_deref())?,
+        &load_config(),
+        rebase,
+        std::time::Duration::from_secs(timeout),
+    )
+    .await?;
+    exit_on(ok)
+}
+
+/// A sweep that failed somewhere exits non-zero so it can gate a script. The
+/// per-repo failures have already been printed in context, so this deliberately
+/// doesn't return an error and have anyhow print a second, vaguer one on top.
+fn exit_on(ok: bool) -> Result<()> {
+    if !ok {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn gather(
