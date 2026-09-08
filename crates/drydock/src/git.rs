@@ -1,0 +1,1249 @@
+//! Talking to git.
+//!
+//! Two deliberate choices here.
+//!
+//! First, this shells out to `git` rather than linking a library. Git's own
+//! status has the untracked cache, index v4 and fsmonitor support, and it
+//! honours whatever per-repo config is in play, so the numbers match exactly
+//! what you see on the command line and in a GUI client. Process startup is
+//! about half a millisecond, which is noise next to the working-tree scan it
+//! wraps.
+//!
+//! Second, every invocation passes `--no-optional-locks`. Without it, polling
+//! hundreds of repos would take `index.lock` and rewrite indexes constantly,
+//! fighting whatever else is open on the same repo and churning mtimes that
+//! this tool then reads back as activity.
+//!
+//! Anything derivable by reading a file under `.git` directly is read directly:
+//! stash count, index mtime, in-progress operations, shallowness, remote URL.
+//! At 500-plus repos, a process spawn avoided is worth having.
+
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::process::Command;
+
+use crate::config::{Config, ReleaseConfig, StatusConfig};
+use crate::model::{
+    BranchInfo, ChangeKind, ChangedFile, ChangelogInfo, CommitInfo, Head, Operation, RefsInfo,
+    TagInfo, WorkInfo, WorkKey,
+};
+
+/// Cap on how long any single git invocation may take. A repo on a stalled
+/// network mount shouldn't be able to hold up a sweep.
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many tags to pull dates for. Only used to date the tag `describe`
+/// picked, so the newest few hundred is plenty.
+const TAG_LIMIT: usize = 400;
+
+/// One `git` invocation against a repo, with the safety rails applied.
+async fn run_git(root: &Path, args: &[&str]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--no-optional-locks")
+        .arg("-c")
+        .arg("core.quotepath=false")
+        .arg("-c")
+        .arg("color.ui=false")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(GIT_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| anyhow!("git {} timed out", args.join(" ")))?
+        .with_context(|| format!("Running git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            if stderr.is_empty() {
+                "no output".into()
+            } else {
+                stderr
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Like [`run_git`], but a non-zero exit is an expected outcome rather than an
+/// error. `describe` on a repo with no tags is the motivating case.
+async fn try_git(root: &Path, args: &[&str]) -> Option<String> {
+    run_git(root, args).await.ok()
+}
+
+/// Resolve the real git directory for a checkout, following the `gitdir:`
+/// pointer that worktrees and submodules leave in a `.git` file.
+pub fn resolve_git_dir(root: &Path) -> Result<PathBuf> {
+    let dot_git = root.join(".git");
+    let meta =
+        std::fs::metadata(&dot_git).with_context(|| format!("No .git at {}", root.display()))?;
+    if meta.is_dir() {
+        return Ok(dot_git);
+    }
+    let body = std::fs::read_to_string(&dot_git)
+        .with_context(|| format!("Reading {}", dot_git.display()))?;
+    let target = body
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(|s| s.trim())
+        .ok_or_else(|| anyhow!("{} has no gitdir pointer", dot_git.display()))?;
+    let target = PathBuf::from(target);
+    Ok(if target.is_absolute() {
+        target
+    } else {
+        root.join(target)
+    })
+}
+
+/// Whether a checkout is a bare repository, read straight from its config.
+///
+/// Discovery needs this answer before any probing has happened, so it pays for
+/// its own small read rather than waiting on [`RefsInfo::is_bare`]. That costs
+/// one `config` read per repo found, and only where the answer changes what
+/// discovery does next.
+pub fn is_bare(root: &Path) -> bool {
+    resolve_git_dir(root)
+        .map(|git_dir| scan_git_config(&git_dir).bare)
+        .unwrap_or(false)
+}
+
+fn mtime_secs(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
+fn file_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+pub fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The cheap fingerprint that decides whether a cached working-tree scan is
+/// still valid: if HEAD hasn't moved and the index hasn't been rewritten,
+/// nothing git knows about has changed.
+///
+/// Note this deliberately doesn't try to capture unsaved working-tree edits;
+/// those are caught by the filesystem watcher instead.
+pub fn work_key(root: &Path, head_sha: Option<String>) -> WorkKey {
+    let index = resolve_git_dir(root)
+        .map(|d| d.join("index"))
+        .unwrap_or_else(|_| root.join(".git/index"));
+    WorkKey {
+        head_sha,
+        index_mtime: mtime_secs(&index),
+        index_size: file_size(&index),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: refs, tags, and everything readable straight out of .git
+// ---------------------------------------------------------------------------
+
+/// Single format string covering both branches and tags, so one
+/// `for-each-ref` call answers most of tier 1. The leading full refname says
+/// which kind of ref each line describes.
+const REF_FORMAT: &str = concat!(
+    "%(refname)\t",
+    "%(upstream:short)\t",
+    "%(upstream:track)\t",
+    "%(committerdate:unix)\t",
+    "%(creatordate:unix)\t",
+    "%(objectname:short)\t",
+    "%(contents:subject)"
+);
+
+pub async fn probe_refs(root: &Path, cfg: &Config) -> Result<RefsInfo> {
+    let git_dir = resolve_git_dir(root)?;
+
+    let raw = run_git(
+        root,
+        &[
+            "for-each-ref",
+            &format!("--format={REF_FORMAT}"),
+            "refs/heads",
+            "refs/tags",
+        ],
+    )
+    .await?;
+
+    let mut branches: Vec<BranchInfo> = Vec::new();
+    let mut tags: Vec<TagInfo> = Vec::new();
+    for line in raw.lines() {
+        let fields: Vec<&str> = line.splitn(7, '\t').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let refname = fields[0];
+        if let Some(name) = refname.strip_prefix("refs/heads/") {
+            let (ahead, behind, gone) = parse_track(fields[2]);
+            branches.push(BranchInfo {
+                name: name.to_string(),
+                upstream: (!fields[1].is_empty()).then(|| fields[1].to_string()),
+                ahead,
+                behind,
+                gone,
+                committed_at: fields[3].parse().unwrap_or(0),
+                sha: fields[5].to_string(),
+                subject: fields[6].to_string(),
+            });
+        } else if let Some(name) = refname.strip_prefix("refs/tags/") {
+            tags.push(TagInfo {
+                name: name.to_string(),
+                at: fields[4].parse().unwrap_or(0),
+            });
+        }
+    }
+
+    // Only tags matching the release pattern count. Without this, a marker tag
+    // like `latest` or `polar-live` gets treated as the last release and the
+    // "commits since tag" number becomes meaningless.
+    let tag_matcher = compile_tag_pattern(&cfg.release.tag_pattern);
+    if let Some(matcher) = &tag_matcher {
+        tags.retain(|t| matcher.is_match(t.name.as_str()));
+    }
+    tags.sort_by_key(|t| std::cmp::Reverse(t.at));
+    tags.truncate(TAG_LIMIT);
+    let newest_tag = tags.first().cloned();
+
+    let head = read_head(&git_dir, &branches)?;
+    let head_branch = head.branch().map(|s| s.to_string());
+    let last_commit = match &head {
+        Head::Unborn => None,
+        Head::Branch(name) => branches
+            .iter()
+            .find(|b| &b.name == name)
+            .map(|b| CommitInfo {
+                sha: b.sha.clone(),
+                at: b.committed_at,
+                subject: b.subject.clone(),
+                author: String::new(),
+            }),
+        Head::Detached { .. } => None,
+    };
+    // Detached HEAD isn't in refs/heads, so it needs its own lookup. Same for
+    // a branch whose ref somehow didn't come back above.
+    let last_commit = match last_commit {
+        Some(c) => Some(c),
+        None if !matches!(head, Head::Unborn) => head_commit(root).await,
+        None => None,
+    };
+
+    let (described_tag, commits_since_tag, since_tag_subjects) = if matches!(head, Head::Unborn) {
+        (None, None, Vec::new())
+    } else {
+        describe_since_tag(root, &tags, &cfg.release).await
+    };
+
+    let cfg_scan = scan_git_config(&git_dir);
+    let is_shallow = git_dir.join("shallow").exists();
+
+    // Only worth asking when HEAD couldn't describe: if it could, the tag is
+    // reachable by definition. A shallow clone is excluded because its history
+    // is truncated, so `--contains` reports nothing for tags that are really
+    // there.
+    let tags_orphaned = if described_tag.is_none() && !is_shallow {
+        match &newest_tag {
+            Some(tag) => tag_is_orphaned(root, &tag.name).await,
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    let mut refs = RefsInfo {
+        head,
+        branches,
+        last_commit,
+        stashes: count_stashes(&git_dir),
+        operation: detect_operation(&git_dir),
+        newest_tag,
+        described_tag,
+        commits_since_tag,
+        since_tag_subjects,
+        tags_orphaned,
+        index_mtime: mtime_secs(&git_dir.join("index")),
+        fetched_at: last_fetch_at(&git_dir),
+        remote_url: cfg_scan.remote_url,
+        changelog: None,
+        is_bare: cfg_scan.bare,
+        is_shallow,
+    };
+
+    if cfg.release.read_changelog {
+        refs.changelog = read_changelog(root, &refs, &cfg.release);
+    }
+    let _ = head_branch;
+    Ok(refs)
+}
+
+/// Parse `%(upstream:track)`, which looks like `[ahead 3, behind 1]`,
+/// `[behind 2]`, `[gone]`, or is empty when in sync.
+fn parse_track(raw: &str) -> (u32, u32, bool) {
+    let inner = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    if inner.is_empty() {
+        return (0, 0, false);
+    }
+    if inner == "gone" {
+        return (0, 0, true);
+    }
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in inner.split(',') {
+        let part = part.trim();
+        if let Some(n) = part.strip_prefix("ahead ") {
+            ahead = n.trim().parse().unwrap_or(0);
+        } else if let Some(n) = part.strip_prefix("behind ") {
+            behind = n.trim().parse().unwrap_or(0);
+        }
+    }
+    (ahead, behind, false)
+}
+
+/// Read HEAD out of the git directory rather than asking git, which also gets
+/// the unborn case right: a symref pointing at a branch that has no commits
+/// yet.
+fn read_head(git_dir: &Path, branches: &[BranchInfo]) -> Result<Head> {
+    let raw = std::fs::read_to_string(git_dir.join("HEAD"))
+        .with_context(|| format!("Reading {}", git_dir.join("HEAD").display()))?;
+    let raw = raw.trim();
+    if let Some(refname) = raw.strip_prefix("ref:") {
+        let refname = refname.trim();
+        let name = refname
+            .strip_prefix("refs/heads/")
+            .unwrap_or(refname)
+            .to_string();
+        if branches.iter().any(|b| b.name == name) {
+            Ok(Head::Branch(name))
+        } else {
+            // Symref to a branch that doesn't exist: a repo with no commits.
+            Ok(Head::Unborn)
+        }
+    } else if raw.len() >= 7 {
+        Ok(Head::Detached {
+            sha: raw[..7].to_string(),
+        })
+    } else {
+        Ok(Head::Unborn)
+    }
+}
+
+async fn head_commit(root: &Path) -> Option<CommitInfo> {
+    let raw = try_git(
+        root,
+        &["log", "-1", "--format=%h%x09%ct%x09%an%x09%s", "HEAD"],
+    )
+    .await?;
+    let line = raw.lines().next()?;
+    let f: Vec<&str> = line.splitn(4, '\t').collect();
+    if f.len() < 4 {
+        return None;
+    }
+    Some(CommitInfo {
+        sha: f[0].to_string(),
+        at: f[1].parse().unwrap_or(0),
+        author: f[2].to_string(),
+        subject: f[3].to_string(),
+    })
+}
+
+/// Work out the nearest tag reachable from HEAD and how far ahead of it we are.
+///
+/// `describe` is used rather than "newest tag by date" on purpose. With
+/// git-flow, tags land on `master` while work carries on on `develop`, so the
+/// newest tag by date is often not an ancestor of HEAD at all. Both values get
+/// stored so the difference can be shown rather than silently papered over.
+///
+/// Merge commits are excluded from the count. Immediately after a git-flow
+/// release, `develop` carries a "Merge tag 'x.y.z' into develop" commit that is
+/// not reachable from the tag, so a raw count reports one commit to release
+/// when there is nothing to release at all. Across a real tree of 558 repos
+/// that accounted for 86 of 193 unreleased flags, and not one of them had a
+/// tree that differed from its tag. A merge commit contributes no work of its
+/// own; whatever it brought along is counted through its own commits.
+/// True when no branch anywhere, local or remote, can reach this tag.
+///
+/// Repos get reused. A theme gets rewritten from scratch, a skeleton gets
+/// rebuilt on a fresh history, and the old tags stay behind pointing at commits
+/// nothing references any more. Treating those as releases of what is checked
+/// out now reports work against a version that was never cut from this code.
+///
+/// One `for-each-ref`, and only for repos where HEAD already failed to
+/// describe, so this costs nothing on the common path.
+async fn tag_is_orphaned(root: &Path, tag: &str) -> bool {
+    let contains = format!("--contains={tag}");
+    match try_git(
+        root,
+        &[
+            "for-each-ref",
+            &contains,
+            "--count=1",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .await
+    {
+        Some(out) => out.trim().is_empty(),
+        // A failed call means we don't know, and guessing "orphaned" would
+        // silently downgrade a real release to never-released.
+        None => false,
+    }
+}
+
+async fn describe_since_tag(
+    root: &Path,
+    tags: &[TagInfo],
+    cfg: &ReleaseConfig,
+) -> (Option<TagInfo>, Option<u32>, Vec<String>) {
+    let match_arg = format!("--match={}", cfg.tag_pattern);
+    let mut describe_args = vec!["describe", "--tags", "--abbrev=0"];
+    if cfg.tag_pattern != "*" && !cfg.tag_pattern.is_empty() {
+        describe_args.push(&match_arg);
+    }
+    describe_args.push("HEAD");
+    let name = match try_git(root, &describe_args).await {
+        Some(out) => out.trim().to_string(),
+        None => return (None, None, Vec::new()),
+    };
+    if name.is_empty() {
+        return (None, None, Vec::new());
+    }
+    let at = tags
+        .iter()
+        .find(|t| t.name == name)
+        .map(|t| t.at)
+        .unwrap_or(0);
+    let tag = TagInfo {
+        name: name.clone(),
+        at,
+    };
+
+    let range = format!("{name}..HEAD");
+    let mut count = try_git(root, &["rev-list", "--count", "--no-merges", &range])
+        .await
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    // Discounting merges is right for the back-merge, but a merge can also be
+    // the only commit that introduces a change, and reporting that as released
+    // would hide work rather than merely nag about it. So when nothing but
+    // merges follow the tag, compare the trees before believing it. The extra
+    // call only happens for repos that look released, and the diff is against
+    // an ancestor, so it is cheap.
+    if count == Some(0) {
+        let unchanged = run_git(root, &["diff", "--quiet", &name, "HEAD"])
+            .await
+            .is_ok();
+        if !unchanged {
+            count = try_git(root, &["rev-list", "--count", &range])
+                .await
+                .and_then(|s| s.trim().parse::<u32>().ok());
+        }
+    }
+
+    let subjects = match count {
+        Some(n) if n > 0 && cfg.max_subjects > 0 => {
+            let limit = format!("--max-count={}", cfg.max_subjects);
+            // Merge subjects are dropped here too: they are never the release
+            // note. If a merge is the only thing there, the count above still
+            // reports it, so nothing goes unnoticed.
+            try_git(root, &["log", &limit, "--no-merges", "--format=%s", &range])
+                .await
+                .map(|s| s.lines().map(|l| l.to_string()).collect())
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    (Some(tag), count, subjects)
+}
+
+/// Compile the release tag glob. `None` means "match everything", so an
+/// unparseable pattern degrades to no filtering rather than to no tags.
+fn compile_tag_pattern(pattern: &str) -> Option<globset::GlobMatcher> {
+    if pattern.is_empty() || pattern == "*" {
+        return None;
+    }
+    match globset::Glob::new(pattern) {
+        Ok(glob) => Some(glob.compile_matcher()),
+        Err(err) => {
+            tracing::warn!(%pattern, %err, "ignoring invalid release.tag_pattern");
+            None
+        }
+    }
+}
+
+/// Stash entries are reflog lines, so the count is just the line count of the
+/// stash reflog. No process needed.
+fn count_stashes(git_dir: &Path) -> u32 {
+    let log = git_dir.join("logs/refs/stash");
+    match std::fs::read_to_string(log) {
+        Ok(body) => body.lines().filter(|l| !l.trim().is_empty()).count() as u32,
+        Err(_) => 0,
+    }
+}
+
+/// A half-finished operation shows up as a marker file or directory in the git
+/// dir.
+fn detect_operation(git_dir: &Path) -> Option<Operation> {
+    let checks: [(&str, Operation); 7] = [
+        ("rebase-merge", Operation::Rebase),
+        ("rebase-apply", Operation::Rebase),
+        ("MERGE_HEAD", Operation::Merge),
+        ("CHERRY_PICK_HEAD", Operation::CherryPick),
+        ("REVERT_HEAD", Operation::Revert),
+        ("BISECT_LOG", Operation::Bisect),
+        ("BISECT_START", Operation::Bisect),
+    ];
+    checks
+        .iter()
+        .find(|(name, _)| git_dir.join(name).exists())
+        .map(|(_, op)| *op)
+}
+
+#[derive(Default)]
+struct GitConfigScan {
+    remote_url: Option<String>,
+    bare: bool,
+}
+
+/// Whether this git directory belongs to a linked worktree rather than to the
+/// repository itself. The `commondir` pointer beside HEAD is what git leaves
+/// to say so.
+fn is_linked_worktree(git_dir: &Path) -> bool {
+    git_dir.join("commondir").is_file()
+}
+
+/// The git directory shared by every worktree of a repository, which is where
+/// `config` actually lives.
+///
+/// A linked worktree's own git dir (`.git/worktrees/<name>`) holds its HEAD,
+/// index and refs, but no `config` — that one file is shared, and reached
+/// through the `commondir` pointer. Reading config from the worktree's own
+/// directory finds nothing at all, which is why every linked worktree used to
+/// report "no remote configured" no matter what its remote was.
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    let Ok(body) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let target = PathBuf::from(body.trim());
+    if target.is_absolute() {
+        target
+    } else {
+        git_dir.join(target)
+    }
+}
+
+/// Pull the bits of `.git/config` worth having without paying for a `git
+/// config` process. `origin` wins if present, otherwise the first remote found.
+fn scan_git_config(git_dir: &Path) -> GitConfigScan {
+    let mut scan = GitConfigScan::default();
+    // `core.bare` describes the repository, but a linked worktree of a bare
+    // repo has a working tree of its own -- only the checkout that owns the
+    // git directory can be the bare one. Settled before reading anything,
+    // because the config below is the *shared* one and would say `true`.
+    let linked = is_linked_worktree(git_dir);
+    let body = match std::fs::read_to_string(common_git_dir(git_dir).join("config")) {
+        Ok(b) => b,
+        Err(_) => return scan,
+    };
+
+    let mut section = String::new();
+    let mut subsection = String::new();
+    let mut first_remote: Option<String> = None;
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            let inner = &line[1..line.len() - 1];
+            match inner.split_once(' ') {
+                Some((s, sub)) => {
+                    section = s.trim().to_ascii_lowercase();
+                    subsection = sub.trim().trim_matches('"').to_string();
+                }
+                None => {
+                    section = inner.trim().to_ascii_lowercase();
+                    subsection.clear();
+                }
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+
+        if section == "core" && key == "bare" {
+            scan.bare = value.eq_ignore_ascii_case("true");
+        }
+        if section == "remote" && key == "url" {
+            if subsection == "origin" {
+                scan.remote_url = Some(value.clone());
+            } else if first_remote.is_none() {
+                first_remote = Some(value);
+            }
+        }
+    }
+    if scan.remote_url.is_none() {
+        scan.remote_url = first_remote;
+    }
+    if linked {
+        scan.bare = false;
+    }
+    scan
+}
+
+/// When this repo last fetched, from `FETCH_HEAD`'s mtime, or `None` if it
+/// never has.
+///
+/// Read off the filesystem rather than tracked by this tool, because the
+/// question is "when did anything last talk to the remote", not "when did
+/// drydock last talk to it". Git rewrites `FETCH_HEAD` on every fetch and
+/// every pull, so a fetch you ran yourself in a terminal counts, which is the
+/// honest answer and the one that stops this from nagging about a repo you
+/// just pulled.
+///
+/// `None` is a real answer too: `git clone` doesn't write `FETCH_HEAD`, so a
+/// fresh clone that's never fetched has none, and its "behind" count has
+/// never been checked against anything.
+fn last_fetch_at(git_dir: &Path) -> Option<i64> {
+    mtime_secs(&common_git_dir(git_dir).join("FETCH_HEAD"))
+}
+
+/// The remote URL without probing the repo, for callers that only need to
+/// know whether there's anything to fetch. One file read, no process: the
+/// fetch phase runs before tier 1 has established anything, and spawning a
+/// `git fetch` per remote-less repo to watch it no-op is a few hundred
+/// processes to learn what `.git/config` already says.
+pub fn quick_remote_url(root: &Path) -> Option<String> {
+    scan_git_config(&resolve_git_dir(root).ok()?).remote_url
+}
+
+/// Compare the top version heading in the changelog against the tags that
+/// exist. A changelog sitting above its newest tag is an in-flight release.
+fn read_changelog(root: &Path, refs: &RefsInfo, cfg: &ReleaseConfig) -> Option<ChangelogInfo> {
+    let path = cfg
+        .changelog_files
+        .iter()
+        .map(|f| root.join(f))
+        .find(|p| p.is_file())?;
+    let body = std::fs::read_to_string(&path).ok()?;
+
+    let mut versions: Vec<String> = Vec::new();
+    for line in body.lines().take(400) {
+        if let Some(v) = parse_changelog_version(line) {
+            versions.push(v);
+            if versions.len() >= 12 {
+                break;
+            }
+        }
+    }
+    let top = versions.first()?.clone();
+
+    let tag_matches = |v: &str| {
+        refs.newest_tag.is_some()
+            && (refs
+                .described_tag
+                .as_ref()
+                .is_some_and(|t| tag_eq_version(&t.name, v))
+                || refs
+                    .newest_tag
+                    .as_ref()
+                    .is_some_and(|t| tag_eq_version(&t.name, v)))
+    };
+
+    let tagged = tag_matches(&top);
+    // Count the leading run of versions that have no tag yet. More than one
+    // means release blocks have stacked up instead of being consolidated.
+    let unreleased_blocks = versions.iter().take_while(|v| !tag_matches(v)).count() as u32;
+
+    Some(ChangelogInfo {
+        version: top,
+        tagged,
+        unreleased_blocks,
+    })
+}
+
+/// Recognise a changelog version heading. Covers `# 1.2.3`, `## [1.2.3]`,
+/// `# v1.2.3 - date`, and the bare `1.2.3` headings Grav plugins use.
+fn parse_changelog_version(line: &str) -> Option<String> {
+    let t = line.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let t = t.trim_start_matches('#').trim();
+    let t = t.trim_start_matches('[');
+    let token = t.split_whitespace().next()?;
+    let token = token
+        .trim_end_matches(']')
+        .trim_end_matches(':')
+        .trim_start_matches('v');
+    let mut chars = token.chars();
+    if !chars.next()?.is_ascii_digit() {
+        return None;
+    }
+    if !token.contains('.') {
+        return None;
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+    {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn tag_eq_version(tag: &str, version: &str) -> bool {
+    tag.trim_start_matches('v') == version.trim_start_matches('v')
+}
+
+// ---------------------------------------------------------------------------
+// Remote freshness
+// ---------------------------------------------------------------------------
+
+/// Fetch, so "behind" counts mean something.
+///
+/// Everything else in this module is local and free. This is not: it hits the
+/// network, and against a few hundred repos that is real traffic. So it only
+/// ever happens on request or on a long timer, credential prompts are refused
+/// rather than left to block, and a hung remote is capped by its own timeout
+/// instead of the general one.
+///
+/// Tags come along, by git's ordinary auto-follow: a tag pointing at a commit
+/// we just fetched is fetched with it. This used to pass `--no-tags`, which
+/// made a fetch refresh the branch half of the table and quietly leave the
+/// release half stale -- a tag pushed from another machine never arrived, so
+/// a repo went on reporting `needs release` for work that had already been
+/// released. Auto-follow costs nothing beyond the refs already coming down.
+///
+/// Not `--prune-tags`, though, which is the same argument in reverse: it
+/// deletes local tags the remote doesn't have, and a tag you cut but haven't
+/// pushed is exactly what `needs release` is built to find. Pruning branches
+/// is safe because a remote-tracking branch is a copy of the remote's; a tag
+/// is not.
+pub async fn fetch(root: &Path, timeout: Duration) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "credential.interactive=false",
+            "fetch",
+            "--all",
+            "--prune",
+            "--quiet",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+
+    let output = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| anyhow!("fetch timed out after {}s", timeout.as_secs()))?
+        .context("Running git fetch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "fetch failed: {}",
+            if stderr.is_empty() {
+                "no output".to_string()
+            } else {
+                stderr.lines().next().unwrap_or("").to_string()
+            }
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2: the working tree
+// ---------------------------------------------------------------------------
+
+pub async fn probe_work(root: &Path, cfg: &StatusConfig) -> Result<WorkInfo> {
+    // No `--branch`: that makes git compute ahead/behind with a revwalk, and
+    // tier 1 already has those numbers from the tracking refs.
+    let raw = run_git(
+        root,
+        &[
+            "status",
+            "--porcelain=v2",
+            cfg.untracked.as_git_arg(),
+            "--ignore-submodules=dirty",
+        ],
+    )
+    .await?;
+
+    let mut info = WorkInfo {
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        conflicts: 0,
+        newest_mtime: None,
+        files: Vec::new(),
+        truncated: false,
+    };
+
+    for line in raw.lines() {
+        let Some((tag, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        let (path, code, kind) = match tag {
+            // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+            // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path><tab><orig>
+            "1" | "2" => {
+                let leading = if tag == "2" { 9 } else { 8 };
+                let path = field_tail(rest, leading);
+                let xy = rest.get(..2).unwrap_or("..");
+                let mut chars = xy.chars();
+                let x = chars.next().unwrap_or('.');
+                let y = chars.next().unwrap_or('.');
+                if x != '.' {
+                    info.staged += 1;
+                }
+                if y != '.' {
+                    info.unstaged += 1;
+                }
+                let kind = if y != '.' {
+                    ChangeKind::Unstaged
+                } else {
+                    ChangeKind::Staged
+                };
+                (path, xy.to_string(), kind)
+            }
+            // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+            "u" => {
+                info.conflicts += 1;
+                let path = field_tail(rest, 10);
+                let xy = rest.get(..2).unwrap_or("UU");
+                (path, xy.to_string(), ChangeKind::Conflicted)
+            }
+            "?" => {
+                info.untracked += 1;
+                (rest.to_string(), "??".to_string(), ChangeKind::Untracked)
+            }
+            _ => continue,
+        };
+
+        if info.files.len() < cfg.max_files {
+            info.files.push(ChangedFile {
+                path,
+                code,
+                kind,
+                mtime: None,
+            });
+        } else {
+            info.truncated = true;
+        }
+    }
+
+    stat_changed_files(root, &mut info);
+    Ok(info)
+}
+
+/// Take the final field of a porcelain v2 record, given how many
+/// space-separated fields precede the path. Paths can contain spaces, and for
+/// rename records a tab separates the new path from the original.
+fn field_tail(rest: &str, field_count: usize) -> String {
+    rest.splitn(field_count, ' ')
+        .last()
+        .unwrap_or("")
+        .split('\t')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Timestamp the changed files.
+///
+/// This is what makes "modified in the last hour" work at all: a working-tree
+/// edit touches nothing under `.git`, so a dirty repo's real activity time can
+/// only come from the files themselves. Status already named them, so this is
+/// a handful of stat calls on the repos that have changes and nothing at all
+/// on the ones that don't.
+fn stat_changed_files(root: &Path, info: &mut WorkInfo) {
+    let mut newest: Option<i64> = None;
+    for file in info.files.iter_mut() {
+        let path = root.join(file.path.trim_end_matches('/'));
+        if let Some(m) = mtime_secs(&path) {
+            file.mtime = Some(m);
+            newest = Some(newest.map_or(m, |n: i64| n.max(m)));
+        }
+    }
+    info.newest_mtime = newest;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ReleaseState, RepoStatus};
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    // A linked worktree's git dir holds HEAD and refs but no `config` -- that
+    // one file is shared, and reached through `commondir`. Reading it from the
+    // worktree's own directory finds nothing, which made every linked
+    // worktree report "no remote configured" whatever its remote actually was.
+    #[test]
+    fn a_linked_worktree_reads_the_remote_from_the_shared_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main", "."]);
+        git(
+            &main,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        git(&main, &["commit", "-qm", "init", "--allow-empty"]);
+        git(&main, &["worktree", "add", "-q", "../side", "-b", "side"]);
+
+        let side = dir.path().join("side");
+        assert!(side.join(".git").is_file(), "expected a gitdir pointer");
+        let git_dir = resolve_git_dir(&side).unwrap();
+        assert!(
+            !git_dir.join("config").exists(),
+            "the premise: no config in the worktree's own git dir"
+        );
+        assert_eq!(
+            scan_git_config(&git_dir).remote_url.as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+    }
+
+    // `core.bare` describes the repository, and a linked worktree of a bare
+    // repo has a working tree of its own. Reading the shared config without
+    // that caveat would call the worktree bare and skip its scan entirely.
+    #[test]
+    fn a_linked_worktree_of_a_bare_repo_is_not_itself_bare() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        git(&upstream, &["init", "-q", "-b", "main", "."]);
+        git(&upstream, &["commit", "-qm", "init", "--allow-empty"]);
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(
+            &repo,
+            &["clone", "-q", "--bare", upstream.to_str().unwrap(), ".git"],
+        );
+        git(
+            &repo,
+            &["--git-dir=.git", "worktree", "add", "-q", "trunk", "main"],
+        );
+
+        assert!(is_bare(&repo), "the bare repo itself");
+        assert!(
+            !is_bare(&repo.join("trunk")),
+            "its worktree has a working tree"
+        );
+    }
+
+    #[test]
+    fn track_parsing() {
+        assert_eq!(parse_track(""), (0, 0, false));
+        assert_eq!(parse_track("[ahead 3]"), (3, 0, false));
+        assert_eq!(parse_track("[behind 2]"), (0, 2, false));
+        assert_eq!(parse_track("[ahead 3, behind 1]"), (3, 1, false));
+        assert_eq!(parse_track("[gone]"), (0, 0, true));
+    }
+
+    #[test]
+    fn changelog_headings() {
+        assert_eq!(parse_changelog_version("# 1.2.3"), Some("1.2.3".into()));
+        assert_eq!(parse_changelog_version("## [2.0.0]"), Some("2.0.0".into()));
+        assert_eq!(
+            parse_changelog_version("# v1.7.48 - 2026-01-01"),
+            Some("1.7.48".into())
+        );
+        assert_eq!(
+            parse_changelog_version("# 2.0.0-rc.3"),
+            Some("2.0.0-rc.3".into())
+        );
+        assert_eq!(parse_changelog_version("## Unreleased"), None);
+        assert_eq!(parse_changelog_version("Some prose line."), None);
+        assert_eq!(parse_changelog_version("# 1"), None);
+    }
+
+    #[test]
+    fn porcelain_paths() {
+        // Ordinary change: 8 fields precede the path.
+        let rest = "M. N... 100644 100644 100644 abc123 abc123 src/main.rs";
+        assert_eq!(field_tail(rest, 8), "src/main.rs");
+        // Path containing spaces.
+        let rest = "?? some dir/a file.txt";
+        assert_eq!(field_tail(rest, 1), "?? some dir/a file.txt");
+        // Rename: 9 fields precede, and the original path follows a tab.
+        let rest = "R. N... 100644 100644 100644 abc abc R100 new/name.rs\told/name.rs";
+        assert_eq!(field_tail(rest, 9), "new/name.rs");
+        // Unmerged: 10 fields precede the path.
+        let rest = "UU N... 100644 100644 100644 100644 h1 h2 h3 conflicted.rs";
+        assert_eq!(field_tail(rest, 10), "conflicted.rs");
+    }
+
+    /// Build a repo shaped like a git-flow release: work on `develop`, the
+    /// release merged to `master` and tagged there, then the tag merged back
+    /// into `develop`.
+    fn git_flow_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git should run");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git(&["init", "-q", "-b", "master"]);
+        std::fs::write(path.join("a.txt"), "a").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "initial"]);
+
+        git(&["checkout", "-q", "-b", "develop"]);
+        std::fs::write(path.join("b.txt"), "b").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the work being released"]);
+
+        // Release: develop merges to master, tagged there.
+        git(&["checkout", "-q", "master"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "develop",
+            "-m",
+            "Merge release/1.0.0",
+        ]);
+        git(&["tag", "1.0.0"]);
+
+        // And the tag merges back into develop, which is the whole problem.
+        git(&["checkout", "-q", "develop"]);
+        git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "1.0.0",
+            "-m",
+            "Merge tag '1.0.0' into develop",
+        ]);
+        dir
+    }
+
+    /// A repo rebuilt on a fresh history keeps its old tags, but they describe
+    /// code that is no longer here. Those must read as never released, not as
+    /// a release the current work has run past.
+    #[tokio::test]
+    async fn tags_left_over_from_a_previous_life_are_not_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .expect("git should run");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(path.join("old.txt"), "old").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the old theme"]);
+        git(&["tag", "1.1.0"]);
+
+        // Rewritten from scratch: a fresh root commit, and `main` moved onto it
+        // so nothing references the tagged commit any more.
+        git(&["checkout", "-q", "--orphan", "rewrite"]);
+        git(&["rm", "-rqf", "."]);
+        std::fs::write(path.join("new.txt"), "new").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "rewritten from scratch"]);
+        git(&["branch", "-qM", "main"]);
+
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
+        assert_eq!(
+            refs.newest_tag.as_ref().map(|t| t.name.as_str()),
+            Some("1.1.0")
+        );
+        assert!(refs.described_tag.is_none(), "the tag is unreachable");
+        assert!(refs.tags_orphaned, "no branch can reach it either");
+        assert!(!refs.tag_off_branch(), "an orphaned tag is not off-branch");
+
+        let mut repo = RepoStatus::new(path.to_path_buf(), "g".into(), "r".into());
+        repo.refs = Some(refs);
+        assert_eq!(repo.release_state(), ReleaseState::Unreleased);
+        assert_eq!(repo.tag_label(), "-");
+    }
+
+    /// The same unreachable tag, but still sitting on another branch, is a real
+    /// release. Only the checked-out branch has moved off it.
+    #[tokio::test]
+    async fn a_tag_on_a_sibling_branch_is_still_a_release() {
+        let dir = git_flow_repo();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .expect("git should run");
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        // A branch that forked before the release ever happened.
+        git(&["checkout", "-q", "-b", "side", "master~1"]);
+
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
+        assert!(refs.described_tag.is_none(), "the tag is unreachable");
+        assert!(!refs.tags_orphaned, "master still holds it");
+    }
+
+    /// A git-flow back-merge must not read as something to release.
+    #[tokio::test]
+    async fn back_merge_is_not_unreleased_work() {
+        let dir = git_flow_repo();
+        let cfg = Config::default();
+
+        // The back-merge is genuinely a commit the tag cannot reach, so a raw
+        // count sees one. It carries no work, so the reported count is zero.
+        let raw = std::process::Command::new("git")
+            .args(["rev-list", "--count", "1.0.0..HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&raw.stdout).trim(), "1");
+
+        let refs = probe_refs(dir.path(), &cfg).await.unwrap();
+        assert_eq!(refs.described_tag.map(|t| t.name), Some("1.0.0".into()));
+        assert_eq!(refs.commits_since_tag, Some(0));
+        assert!(refs.since_tag_subjects.is_empty());
+    }
+
+    /// A merge that is the only commit after the tag but genuinely changes the
+    /// tree must still count. Discounting merges is about the back-merge, and
+    /// must never hide real work.
+    #[tokio::test]
+    async fn a_merge_that_changes_the_tree_still_counts() {
+        let dir = git_flow_repo();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+        };
+
+        // A branch off the tagged commit, merged into develop. The merge is the
+        // only thing develop gains that isn't already reachable another way.
+        git(&["checkout", "-q", "-b", "hotfix", "1.0.0"]);
+        std::fs::write(path.join("fix.txt"), "fix").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the hotfix"]);
+        git(&["checkout", "-q", "develop"]);
+        git(&["merge", "-q", "--no-ff", "hotfix", "-m", "Merge hotfix"]);
+
+        let refs = probe_refs(path, &Config::default()).await.unwrap();
+        assert_eq!(
+            refs.described_tag.as_ref().map(|t| t.name.as_str()),
+            Some("1.0.0")
+        );
+        assert!(
+            refs.commits_since_tag.unwrap_or(0) > 0,
+            "a merge that changes the tree must not read as released"
+        );
+    }
+
+    /// Real work after the tag still counts, back-merge or not.
+    #[tokio::test]
+    async fn commits_after_the_back_merge_still_count() {
+        let dir = git_flow_repo();
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "a genuine fix after the release"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+        }
+
+        let refs = probe_refs(dir.path(), &Config::default()).await.unwrap();
+        assert_eq!(refs.commits_since_tag, Some(1));
+        assert_eq!(
+            refs.since_tag_subjects,
+            vec!["a genuine fix after the release".to_string()]
+        );
+    }
+
+    #[test]
+    fn tag_version_comparison() {
+        assert!(tag_eq_version("1.2.3", "1.2.3"));
+        assert!(tag_eq_version("v1.2.3", "1.2.3"));
+        assert!(!tag_eq_version("1.2.4", "1.2.3"));
+    }
+}
